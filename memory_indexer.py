@@ -23,7 +23,7 @@ class MemoryIndexer:
 
     def __init__(
         self,
-        memory_md_path: str = "/root/.openclaw/workspace/MEMORY.md",
+        memory_md_path: str = "/root/.openclaw/personalspace/zh-help/MEMORY.md",
         chroma_collection: str = "memory_md"
     ):
         """初始化索引器

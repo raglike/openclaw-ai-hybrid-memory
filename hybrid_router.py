@@ -29,6 +29,12 @@ from cache import get_query_cache, get_embedding_cache, LRUCache
 from bm25_indexer import DailyFileIndexer
 from hybrid_fusion import triple_fusion
 
+# 导入图谱模块
+from graph_config import GRAPH_CONFIG, FEATURE_FLAGS, is_graph_enabled, is_auto_extract_enabled, is_fusion_enabled
+from graph_adapter import GraphAdapter
+from triple_extractor import TripleExtractor
+from graph_fusion import GraphFusion
+
 
 class HybridMemoryRouter:
     """混合记忆路由器"""
@@ -103,6 +109,87 @@ class HybridMemoryRouter:
         print(f"   Cache: {use_cache}")
         print(f"   Parallel: {use_parallel} (workers={max_workers})")
         print(f"   BM25: Enabled")
+
+        # ==================== 图谱模块初始化 ====================
+        self._init_graph_module()
+
+    def _init_graph_module(self) -> None:
+        """初始化图谱模块"""
+        if not is_graph_enabled():
+            print("   Graph: Disabled (enable_graph=False)")
+            self.graph_adapter = None
+            self.triple_extractor = None
+            self.graph_fusion = None
+            return
+
+        print("   Graph: Initializing...")
+
+        # 初始化图谱适配器
+        self.graph_adapter = GraphAdapter(GRAPH_CONFIG)
+        self.graph_adapter.initialize()
+
+        # 初始化三元组提取器
+        self.triple_extractor = TripleExtractor()
+
+        # 初始化图谱融合器
+        self.graph_fusion = GraphFusion(
+            self.graph_adapter,
+            weight=GRAPH_CONFIG.get("fusion_weight", 0.2)
+        )
+
+        # 加载已有图谱数据
+        self._load_graph_data()
+
+        print(f"   Graph: Enabled (entities={self.graph_adapter.stats['entity_count']}, "
+              f"triplets={self.graph_adapter.stats['triplet_count']})")
+
+    def _load_graph_data(self) -> None:
+        """加载图谱数据"""
+        if not is_graph_enabled() or self.graph_adapter is None:
+            return
+
+        graph_path = os.path.join(GRAPH_CONFIG.get("storage_path", "./graph_cache"), "graph_data.pkl")
+        try:
+            self.graph_adapter.load(graph_path)
+            print(f"   ✅ Loaded graph data: {self.graph_adapter.stats}")
+        except FileNotFoundError:
+            print("   📝 No existing graph data, will build from memory files")
+
+    def _save_graph_data(self) -> None:
+        """保存图谱数据"""
+        if not is_graph_enabled() or self.graph_adapter is None:
+            return
+
+        os.makedirs(GRAPH_CONFIG.get("storage_path", "./graph_cache"), exist_ok=True)
+        path = os.path.join(GRAPH_CONFIG.get("storage_path", "./graph_cache"), "graph_data.pkl")
+        self.graph_adapter.save(path)
+
+    def _graph_search(self, query: str, top_k: int = 10) -> List[Dict]:
+        """图谱检索"""
+        if not is_graph_enabled() or self.graph_adapter is None:
+            return []
+
+        # 提取查询中的实体
+        entities = self.triple_extractor._extract_entities(query) if self.triple_extractor else []
+
+        if not entities:
+            return []
+
+        # 查找最相关的实体
+        results = []
+        for entity in entities:
+            related = self.graph_adapter.query_related(entity, top_k)
+            results.extend(related)
+
+        # 去重并排序
+        seen = set()
+        unique_results = []
+        for r in results:
+            if r["entity"] not in seen:
+                seen.add(r["entity"])
+                unique_results.append(r)
+
+        return sorted(unique_results, key=lambda x: -x["score"])[:top_k]
 
     def retrieve(
         self,
@@ -234,7 +321,15 @@ class HybridMemoryRouter:
         # 4. 排序并返回Top-K
         results.sort(key=lambda x: x['score'], reverse=True)
 
-        # 5. 过滤低分结果
+        # 5. 图谱增强（可选）
+        if is_graph_enabled() and is_fusion_enabled() and self.graph_adapter is not None:
+            graph_results = self._graph_search(query, max_results)
+            if graph_results:
+                print(f"   🔗 Graph results: {len(graph_results)}")
+                # 图谱结果已在分数计算中体现
+                # 可通过 graph_fusion 进一步优化
+
+        # 6. 过滤低分结果
         filtered_results = [r for r in results if r['score'] >= min_score]
 
         print(f"   ✅ 最终结果: {len(filtered_results)}/{len(results)} 条 (min_score={min_score})")
@@ -294,6 +389,16 @@ class HybridMemoryRouter:
 
         # 同时写入Daily文件
         self._write_to_daily(content, metadata)
+
+        # ==================== 图谱模块: 提取并存储三元组 ====================
+        if is_graph_enabled() and self.graph_adapter is not None and is_auto_extract_enabled():
+            triples = self.triple_extractor.extract_from_text(content) if self.triple_extractor else []
+            for triple in triples:
+                self.graph_adapter.add_triplet(triple.head, triple.relation, triple.tail)
+
+            # 定期保存图谱
+            if self.graph_adapter.stats["triplet_count"] % 100 == 0:
+                self._save_graph_data()
 
         print(f"   ✅ 存储完成: {record_id}")
 
@@ -727,6 +832,13 @@ class HybridMemoryRouter:
         stats['use_cache'] = self.use_cache
         stats['use_parallel'] = self.use_parallel
         stats['max_workers'] = self.max_workers
+
+        # 添加图谱统计
+        if is_graph_enabled() and self.graph_adapter is not None:
+            stats['graph'] = self.graph_adapter.get_stats()
+            stats['graph_enabled'] = True
+        else:
+            stats['graph_enabled'] = False
 
         return stats
 

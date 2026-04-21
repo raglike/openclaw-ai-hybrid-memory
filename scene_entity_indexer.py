@@ -199,13 +199,30 @@ class SceneEntityIndexer:
 
         return entity_scene_map
 
-    def index_all(self) -> Dict:
-        """索引所有场景文件"""
+    def build_index(self, only_scenes: List[str] = None) -> Dict:
+        """索引场景文件（增量更新入口）"""
+        return self.index_all(only_scenes=only_scenes)
+
+    def index_all(self, only_scenes: List[str] = None) -> Dict:
+        """索引场景文件
+
+        Args:
+            only_scenes: 如果指定，只索引这些场景名（不含扩展名）。
+                       用于增量更新。
+        """
         print(f"🔍 开始索引场景文件: {self.scene_blocks_dir}")
 
         # 获取所有.md文件
         pattern = os.path.join(self.scene_blocks_dir, "*.md")
         files = glob.glob(pattern)
+
+        # 增量更新：只处理指定的场景
+        if only_scenes:
+            files = [
+                f for f in files
+                if os.path.splitext(os.path.basename(f))[0] in set(only_scenes)
+            ]
+            print(f"   🎯 增量模式: 只索引 {len(files)} 个变化的场景")
 
         if not files:
             print(f"⚠️  未找到场景文件: {pattern}")
@@ -228,6 +245,12 @@ class SceneEntityIndexer:
         # 构建entity_scene_map
         entity_scene_map = self.build_entity_scene_map(scene_infos)
 
+        # 收集 scene_mtimes（用于增量更新）
+        scene_mtimes = {}
+        for file_path in files:
+            scene_name = os.path.splitext(os.path.basename(file_path))[0]
+            scene_mtimes[scene_name] = os.path.getmtime(file_path)
+
         # 构建tunnel_index
         tunnel_index = {
             "version": "4.0",
@@ -236,6 +259,7 @@ class SceneEntityIndexer:
             "stats": self.stats,
             "entity_scene_map": entity_scene_map,
             "scenes": scene_infos,
+            "scene_mtimes": scene_mtimes,
             "graph_stats": self.graph_adapter.get_stats(),
         }
 

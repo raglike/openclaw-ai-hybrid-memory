@@ -40,6 +40,7 @@ from graph_config import GRAPH_CONFIG, FEATURE_FLAGS, is_graph_enabled, is_auto_
 from graph_adapter import GraphAdapter
 from triple_extractor import TripleExtractor
 from graph_fusion import GraphFusion
+from scene_entity_indexer import SceneEntityIndexer
 
 
 class HybridMemoryRouter:
@@ -177,7 +178,13 @@ class HybridMemoryRouter:
         self.graph_adapter.save(path)
 
     def _load_tunnel_index(self) -> None:
-        """加载tunnel_index.json - M-Flow EntityBundle"""
+        """加载tunnel_index.json - M-Flow EntityBundle
+
+        增量更新机制：
+        - 每次加载时检查 scene_blocks 目录中所有 .md 文件的 mtime
+        - 与 tunnel_index.json 中存储的 scene_mtimes 对比
+        - 有变化的场景触发增量重抽，更新 tunnel_index.json
+        """
         self.entity_scene_map = {}
 
         tunnel_path = os.path.join(
@@ -185,21 +192,112 @@ class HybridMemoryRouter:
             "tunnel_index.json"
         )
 
+        # Step 1: 收集当前 scene_blocks 目录的 mtime
+        scene_blocks_dir = "/root/.openclaw/memory-tdai/scene_blocks"
+        current_mtimes = {}
+        if os.path.exists(scene_blocks_dir):
+            for f in glob.glob(os.path.join(scene_blocks_dir, "*.md")):
+                scene_name = os.path.splitext(os.path.basename(f))[0]
+                current_mtimes[scene_name] = os.path.getmtime(f)
+
+        # Step 2: 如果 tunnel_index.json 存在，加载并做增量对比
         if not os.path.exists(tunnel_path):
-            print("   📝 No tunnel_index.json found, skipping EntityBundle")
+            # 从零构建
+            print("   📝 No tunnel_index.json found, building from scratch...")
+            self._rebuild_tunnel_index(scene_blocks_dir)
             return
 
         try:
             with open(tunnel_path, 'r', encoding='utf-8') as f:
                 tunnel_data = json.load(f)
 
+            stored_mtimes = tunnel_data.get("scene_mtimes", {})
+            changed_scenes = [
+                name for name, mtime in current_mtimes.items()
+                if stored_mtimes.get(name, 0) < mtime
+            ]
+
             self.entity_scene_map = tunnel_data.get("entity_scene_map", {})
             self.tunnel_scenes = {s["scene_name"]: s for s in tunnel_data.get("scenes", [])}
-            print(f"   ✅ Loaded tunnel_index: {len(self.entity_scene_map)} entity-scene mappings")
+
+            if changed_scenes:
+                print(f"   🔄 Incremental update: {len(changed_scenes)} scenes changed → re-indexing")
+                self._incremental_update(scene_blocks_dir, changed_scenes, tunnel_data)
+            else:
+                print(f"   ✅ Loaded tunnel_index: {len(self.entity_scene_map)} entity-scene mappings (up to date)")
+
         except Exception as e:
-            print(f"   ⚠️  Failed to load tunnel_index.json: {e}")
+            print(f"   ⚠️  Failed to load tunnel_index.json: {e}, rebuilding...")
+            self._rebuild_tunnel_index(scene_blocks_dir)
             self.entity_scene_map = {}
             self.tunnel_scenes = {}
+
+    def _rebuild_tunnel_index(self, scene_blocks_dir: str) -> None:
+        """全量重建 tunnel_index.json"""
+        try:
+            indexer = SceneEntityIndexer(scene_blocks_dir=scene_blocks_dir)
+            result = indexer.build_index()
+
+            tunnel_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "tunnel_index.json"
+            )
+            with open(tunnel_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+
+            self.entity_scene_map = result.get("entity_scene_map", {})
+            self.tunnel_scenes = {s["scene_name"]: s for s in result.get("scenes", [])}
+            print(f"   ✅ Rebuilt tunnel_index: {len(self.entity_scene_map)} entity-scene mappings")
+        except Exception as e:
+            print(f"   ❌ Failed to rebuild tunnel_index: {e}")
+            self.entity_scene_map = {}
+            self.tunnel_scenes = {}
+
+    def _incremental_update(
+        self,
+        scene_blocks_dir: str,
+        changed_scenes: List[str],
+        tunnel_data: Dict
+    ) -> None:
+        """增量更新：只重抽变化的场景，合并到现有 tunnel_index.json"""
+        try:
+            indexer = SceneEntityIndexer(scene_blocks_dir=scene_blocks_dir)
+            # 只索引变化的场景
+            result = indexer.build_index(only_scenes=changed_scenes)
+
+            # 合并 entity_scene_map（替换变化的，保留其他的）
+            new_map = tunnel_data.get("entity_scene_map", {})
+            new_map.update(result.get("entity_scene_map", {}))
+
+            # 合并 scenes
+            old_scenes = {s["scene_name"]: s for s in tunnel_data.get("scenes", [])}
+            old_scenes.update({s["scene_name"]: s for s in result.get("scenes", [])})
+
+            # 合并 scene_mtimes
+            new_mtimes = tunnel_data.get("scene_mtimes", {})
+            new_mtimes.update(result.get("scene_mtimes", {}))
+
+            # 写回 tunnel_index.json
+            tunnel_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "tunnel_index.json"
+            )
+            updated_data = {
+                "entity_scene_map": new_map,
+                "scenes": list(old_scenes.values()),
+                "scene_mtimes": new_mtimes,
+                "updated_at": datetime.now().isoformat()
+            }
+            with open(tunnel_path, 'w', encoding='utf-8') as f:
+                json.dump(updated_data, f, ensure_ascii=False, indent=2)
+
+            self.entity_scene_map = new_map
+            self.tunnel_scenes = old_scenes
+            print(f"   ✅ Incremental update done: {len(self.entity_scene_map)} total mappings")
+
+        except Exception as e:
+            print(f"   ❌ Incremental update failed: {e}, falling back to full rebuild")
+            self._rebuild_tunnel_index(scene_blocks_dir)
 
     def _expand_entity_bundle(
         self,

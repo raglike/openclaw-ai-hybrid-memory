@@ -41,6 +41,7 @@ from graph_adapter import GraphAdapter
 from triple_extractor import TripleExtractor
 from graph_fusion import GraphFusion
 from scene_entity_indexer import SceneEntityIndexer
+from feedback import RetrievalFeedback
 
 
 class HybridMemoryRouter:
@@ -145,6 +146,9 @@ class HybridMemoryRouter:
             weight=GRAPH_CONFIG.get("fusion_weight", 0.2)
         )
 
+        # 初始化检索反馈模块 (P2)
+        self.feedback = RetrievalFeedback()
+
         # 加载已有图谱数据
         self._load_graph_data()
 
@@ -248,6 +252,7 @@ class HybridMemoryRouter:
             self.entity_scene_map = result.get("entity_scene_map", {})
             self.tunnel_scenes = {s["scene_name"]: s for s in result.get("scenes", [])}
             print(f"   ✅ Rebuilt tunnel_index: {len(self.entity_scene_map)} entity-scene mappings")
+            self._sync_to_memory_tdai()
         except Exception as e:
             print(f"   ❌ Failed to rebuild tunnel_index: {e}")
             self.entity_scene_map = {}
@@ -294,10 +299,35 @@ class HybridMemoryRouter:
             self.entity_scene_map = new_map
             self.tunnel_scenes = old_scenes
             print(f"   ✅ Incremental update done: {len(self.entity_scene_map)} total mappings")
+            self._sync_to_memory_tdai()
 
         except Exception as e:
             print(f"   ❌ Incremental update failed: {e}, falling back to full rebuild")
             self._rebuild_tunnel_index(scene_blocks_dir)
+
+    def _sync_to_memory_tdai(self) -> None:
+        """将 hybrid-memory tunnel_index 同步到 memory-tdai tunnel_index.json
+
+        实现 OpenClaw 内置检索 对增强数据的读取
+        """
+        import subprocess
+        sync_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "sync_to_memory_tdai.py"
+        )
+        try:
+            result = subprocess.run(
+                ["python3", sync_script],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                print(f"   🔗 Synced to memory-tdai tunnel_index")
+            else:
+                print(f"   ⚠️ Sync failed: {result.stderr[:100]}")
+        except Exception as e:
+            print(f"   ⚠️ Sync error: {e}")
 
     def _expand_entity_bundle(
         self,
@@ -329,39 +359,75 @@ class HybridMemoryRouter:
         # 通过entity_scene_map扩展场景
         related_scenes = {}
 
+        # P1改进：真实图路径成本计算
         for entity in query_entities:
-            # 精确匹配
+            # 精确匹配（1跳，权重2.0）
             if entity in self.entity_scene_map:
                 for scene_name in self.entity_scene_map[entity]:
                     if scene_name not in related_scenes:
-                        related_scenes[scene_name] = {"entities": [], "score": 0, "exact_score": 0}
+                        related_scenes[scene_name] = {
+                            "entities": [], "score": 0.0,
+                            "exact_score": 0, "path_cost": 999.0
+                        }
                     related_scenes[scene_name]["entities"].append(entity)
-                    related_scenes[scene_name]["score"] += 2.0  # 精确匹配权重2.0
+                    related_scenes[scene_name]["score"] += 2.0
                     related_scenes[scene_name]["exact_score"] += 1
+                    related_scenes[scene_name]["path_cost"] = min(
+                        related_scenes[scene_name]["path_cost"], 1.0
+                    )
 
-            # 包含匹配（仅当entity较长时，避免短词噪声）
+            # 包含匹配（2跳，权重1.0）
             if len(entity) >= 4:
                 for mapped_entity, scenes in self.entity_scene_map.items():
                     if entity in mapped_entity and len(mapped_entity) - len(entity) <= 10:
                         for scene_name in scenes:
                             if scene_name not in related_scenes:
-                                related_scenes[scene_name] = {"entities": [], "score": 0, "exact_score": 0}
+                                related_scenes[scene_name] = {
+                                    "entities": [], "score": 0.0,
+                                    "exact_score": 0, "path_cost": 999.0
+                                }
                             related_scenes[scene_name]["entities"].append(mapped_entity)
                             related_scenes[scene_name]["score"] += 0.5
+                            related_scenes[scene_name]["path_cost"] = min(
+                                related_scenes[scene_name]["path_cost"], 2.0
+                            )
+
+            # P1新增：图谱多跳传播
+            # 如果GraphAdapter有该实体的邻居，通过邻居找更多场景（3跳）
+            if self.graph_adapter and hasattr(self.graph_adapter, 'get_neighbors'):
+                neighbors = self.graph_adapter.get_neighbors(entity)
+                for neighbor in neighbors[:5]:  # 最多5个邻居
+                    if neighbor in self.entity_scene_map:
+                        for scene_name in self.entity_scene_map[neighbor]:
+                            if scene_name not in related_scenes:
+                                related_scenes[scene_name] = {
+                                    "entities": [], "score": 0.0,
+                                    "exact_score": 0, "path_cost": 999.0
+                                }
+                            related_scenes[scene_name]["entities"].append(f"{entity}→{neighbor}")
+                            related_scenes[scene_name]["score"] += 0.3  # 3跳，低权重
+                            related_scenes[scene_name]["path_cost"] = min(
+                                related_scenes[scene_name]["path_cost"], 3.0
+                            )
 
         if not related_scenes:
             return []
 
-        # 按精确匹配数排序
+        # P1改进：综合排序 - 精确匹配数 × 路径成本
+        # score = exact_score * 10 - path_cost * 0.5
         bundles = []
         for scene_name, info in sorted(
             related_scenes.items(),
-            key=lambda x: (-x[1]["exact_score"], -x[1]["score"])
+            key=lambda x: (-x[1]["exact_score"], -x[1]["path_cost"])
         )[:top_k]:
             scene_info = self.tunnel_scenes.get(scene_name, {})
 
             # 获取该场景的摘要信息
             summary = scene_info.get("summary", f"场景: {scene_name}")
+
+            # P1：路径成本归一化作为relevance
+            path_cost = info.get("path_cost", 999.0)
+            relevance = max(0.0, 1.0 - (path_cost - 1.0) * 0.2) if path_cost < 999.0 else 0.1
 
             bundle = {
                 "id": f"bundle_{scene_name}",
@@ -371,7 +437,8 @@ class HybridMemoryRouter:
                 "bundle_entities": info["entities"],
                 "bundle_score": info["score"],
                 "bundle_exact_matches": info["exact_score"],
-                "relevance": min(info["exact_score"] / 2.0, 1.0),
+                "bundle_path_cost": path_cost,
+                "relevance": relevance,
                 "days_ago": 0,
             }
             bundles.append(bundle)
@@ -657,6 +724,14 @@ class HybridMemoryRouter:
         # 8. 过滤低分结果
         filtered_results = [r for r in results if r['score'] >= min_score]
 
+        # 9. 应用检索反馈boost (P2)
+        if self.feedback:
+            feedback_stats = self.feedback.get_stats()
+            if feedback_stats['total'] > 0:
+                filtered_results = self.feedback.apply_boost(filtered_results, query)
+                filtered_results.sort(key=lambda x: x.get('score', 0), reverse=True)
+                print(f"   👍 Feedback applied: {feedback_stats['total']} records (relevant={feedback_stats['relevant']})")
+
         print(f"   ✅ 最终结果: {len(filtered_results)}/{len(results)} 条 (min_score={min_score})")
 
         # 缓存结果
@@ -664,6 +739,21 @@ class HybridMemoryRouter:
             self.query_cache.put(query, cache_key_params, filtered_results)
 
         return filtered_results[:max_results]
+
+    def mark_result(self, query: str, result_content: str, relevant: bool = True):
+        """标记检索结果质量（用于反馈学习）
+
+        Args:
+            query: 查询文本
+            result_content: 结果内容
+            relevant: True=有用, False=无用
+        """
+        if not self.feedback:
+            return
+        if relevant:
+            self.feedback.mark_relevant(query, result_content)
+        else:
+            self.feedback.mark_irrelevant(query, result_content)
 
     def store(
         self,

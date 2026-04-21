@@ -8,13 +8,19 @@ Phase 2 - Day 2更新:
 - 集成MemoryIndexer实现MEMORY.md语义检索
 - 集成LRU Cache提升性能
 - 支持批量向量化和异步并发
+
+M-Flow升级 (Phase 4):
+- 集成SceneEntityIndexer的tunnel_index.json
+- EntityBundle跨场景聚合
+- GraphFusion路径成本重排
 """
 
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from datetime import datetime, timedelta
 import os
 import glob
 import sys
+import json
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
@@ -120,6 +126,7 @@ class HybridMemoryRouter:
             self.graph_adapter = None
             self.triple_extractor = None
             self.graph_fusion = None
+            self.entity_scene_map = {}
             return
 
         print("   Graph: Initializing...")
@@ -140,8 +147,13 @@ class HybridMemoryRouter:
         # 加载已有图谱数据
         self._load_graph_data()
 
+        # 加载tunnel_index.json (M-Flow EntityBundle)
+        self._load_tunnel_index()
+
         print(f"   Graph: Enabled (entities={self.graph_adapter.stats['entity_count']}, "
               f"triplets={self.graph_adapter.stats['triplet_count']})")
+        if self.entity_scene_map:
+            print(f"   EntityBundle: {len(self.entity_scene_map)} entities mapped")
 
     def _load_graph_data(self) -> None:
         """加载图谱数据"""
@@ -163,6 +175,201 @@ class HybridMemoryRouter:
         os.makedirs(GRAPH_CONFIG.get("storage_path", "./graph_cache"), exist_ok=True)
         path = os.path.join(GRAPH_CONFIG.get("storage_path", "./graph_cache"), "graph_data.pkl")
         self.graph_adapter.save(path)
+
+    def _load_tunnel_index(self) -> None:
+        """加载tunnel_index.json - M-Flow EntityBundle"""
+        self.entity_scene_map = {}
+
+        tunnel_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "tunnel_index.json"
+        )
+
+        if not os.path.exists(tunnel_path):
+            print("   📝 No tunnel_index.json found, skipping EntityBundle")
+            return
+
+        try:
+            with open(tunnel_path, 'r', encoding='utf-8') as f:
+                tunnel_data = json.load(f)
+
+            self.entity_scene_map = tunnel_data.get("entity_scene_map", {})
+            self.tunnel_scenes = {s["scene_name"]: s for s in tunnel_data.get("scenes", [])}
+            print(f"   ✅ Loaded tunnel_index: {len(self.entity_scene_map)} entity-scene mappings")
+        except Exception as e:
+            print(f"   ⚠️  Failed to load tunnel_index.json: {e}")
+            self.entity_scene_map = {}
+            self.tunnel_scenes = {}
+
+    def _expand_entity_bundle(
+        self,
+        query: str,
+        initial_results: List[Dict],
+        top_k: int = 5
+    ) -> List[Dict]:
+        """M-Flow EntityBundle扩展层
+
+        从Top-K结果中提取实体，通过entity_scene_map找到相关场景，
+        聚合为EntityBundle返回
+
+        Args:
+            query: 查询文本
+            initial_results: 初始检索结果
+            top_k: 返回的Bundle数量
+
+        Returns:
+            EntityBundle聚合结果
+        """
+        if not self.entity_scene_map or not self.triple_extractor:
+            return []
+
+        # 1. 从初始结果中提取实体
+        query_entities = set()
+        for result in initial_results[:top_k]:
+            content = result.get('content', '')
+            entities = self.triple_extractor._extract_entities(content)
+            query_entities.update(entities)
+
+        if not query_entities:
+            return []
+
+        # 2. 通过entity_scene_map扩展场景
+        related_scenes = {}
+        for entity in query_entities:
+            # 精确匹配
+            if entity in self.entity_scene_map:
+                for scene_name in self.entity_scene_map[entity]:
+                    if scene_name not in related_scenes:
+                        related_scenes[scene_name] = {"entities": [], "score": 0}
+                    related_scenes[scene_name]["entities"].append(entity)
+                    related_scenes[scene_name]["score"] += 1
+
+            # 前缀/包含匹配
+            for mapped_entity, scenes in self.entity_scene_map.items():
+                if entity in mapped_entity or mapped_entity in entity:
+                    for scene_name in scenes:
+                        if scene_name not in related_scenes:
+                            related_scenes[scene_name] = {"entities": [], "score": 0}
+                        related_scenes[scene_name]["entities"].append(mapped_entity)
+                        related_scenes[scene_name]["score"] += 0.5
+
+        if not related_scenes:
+            return []
+
+        # 3. 构建EntityBundle结果
+        bundles = []
+        for scene_name, info in sorted(related_scenes.items(), key=lambda x: -x[1]["score"])[:top_k]:
+            scene_info = self.tunnel_scenes.get(scene_name, {})
+
+            # 获取该场景的摘要信息
+            summary = scene_info.get("summary", f"场景: {scene_name}")
+
+            bundle = {
+                "id": f"bundle_{scene_name}",
+                "content": summary,
+                "source": "entity_bundle",
+                "scene_name": scene_name,
+                "bundle_entities": info["entities"],
+                "bundle_score": info["score"],
+                "relevance": min(info["score"] / 5.0, 1.0),
+                "days_ago": 0,
+            }
+            bundles.append(bundle)
+
+        print(f"   🔗 EntityBundle: {len(bundles)} scene bundles expanded")
+        return bundles
+
+    def _graph_rerank(
+        self,
+        results: List[Dict],
+        query: str,
+        top_k: int = 10
+    ) -> List[Dict]:
+        """GraphFusion路径成本重排
+
+        使用图谱路径成本对结果进行重排
+
+        Args:
+            results: 初始排序结果
+            query: 查询文本
+            top_k: 返回结果数
+
+        Returns:
+            重排后的结果
+        """
+        if not is_fusion_enabled() or self.graph_adapter is None:
+            return results
+
+        # 提取查询中的实体
+        query_entities = []
+        if self.triple_extractor:
+            query_entities = self.triple_extractor._extract_entities(query)
+
+        if not query_entities:
+            return results
+
+        # 计算每个结果的图谱路径成本
+        reranked = []
+        for result in results:
+            content = result.get('content', '')
+            result_entities = []
+            if self.triple_extractor:
+                result_entities = self.triple_extractor._extract_entities(content)
+
+            # 计算路径成本（与查询实体的连接强度）
+            path_cost = 0.0
+            for qe in query_entities:
+                for re in result_entities:
+                    if qe == re or qe in re or re in qe:
+                        path_cost += 1.0
+                    # 检查图谱中是否有连接
+                    neighbors = self.graph_adapter.get_neighbors(qe)
+                    if re in neighbors:
+                        path_cost += 2.0
+
+            # 综合评分 = 原评分 + 路径成本 * 0.2
+            new_score = result.get('score', 0) + path_cost * 0.2
+            result['graph_score'] = new_score
+            result['path_cost'] = path_cost
+            reranked.append(result)
+
+        # 按graph_score排序
+        reranked.sort(key=lambda x: -x.get('graph_score', 0))
+
+        return reranked[:top_k]
+
+    def _merge_bundle_results(
+        self,
+        initial_results: List[Dict],
+        bundle_results: List[Dict],
+        max_results: int = 10
+    ) -> List[Dict]:
+        """合并EntityBundle结果与初始结果
+
+        Args:
+            initial_results: 初始检索结果
+            bundle_results: EntityBundle扩展结果
+            max_results: 最大结果数
+
+        Returns:
+            合并后的排序结果
+        """
+        # 避免重复
+        seen_ids = {r.get('id', r.get('content', '')) for r in initial_results}
+
+        merged = list(initial_results)
+
+        # 添加Bundle结果（标记来源）
+        for bundle in bundle_results:
+            bundle_id = bundle.get('id', '')
+            if bundle_id not in seen_ids:
+                merged.append(bundle)
+                seen_ids.add(bundle_id)
+
+        # 按分数重新排序
+        merged.sort(key=lambda x: x.get('score', 0), reverse=True)
+
+        return merged[:max_results]
 
     def _graph_search(self, query: str, top_k: int = 10) -> List[Dict]:
         """图谱检索"""
@@ -326,10 +533,21 @@ class HybridMemoryRouter:
             graph_results = self._graph_search(query, max_results)
             if graph_results:
                 print(f"   🔗 Graph results: {len(graph_results)}")
-                # 图谱结果已在分数计算中体现
-                # 可通过 graph_fusion 进一步优化
 
-        # 6. 过滤低分结果
+        # 6. EntityBundle扩展层 (M-Flow)
+        if self.entity_scene_map and self.tunnel_scenes:
+            bundle_results = self._expand_entity_bundle(query, results, top_k=max_results)
+            if bundle_results:
+                # 将Bundle结果合并到最终结果
+                for bundle in bundle_results:
+                    bundle['score'] = self._calculate_score(bundle, query)
+                results = self._merge_bundle_results(results, bundle_results)
+
+        # 7. GraphFusion路径成本重排
+        if is_graph_enabled() and is_fusion_enabled() and self.graph_adapter is not None:
+            results = self._graph_rerank(results, query, top_k=max_results)
+
+        # 8. 过滤低分结果
         filtered_results = [r for r in results if r['score'] >= min_score]
 
         print(f"   ✅ 最终结果: {len(filtered_results)}/{len(results)} 条 (min_score={min_score})")

@@ -209,12 +209,12 @@ class HybridMemoryRouter:
     ) -> List[Dict]:
         """M-Flow EntityBundle扩展层
 
-        从Top-K结果中提取实体，通过entity_scene_map找到相关场景，
+        仅从查询本身提取实体，通过entity_scene_map找到相关场景，
         聚合为EntityBundle返回
 
         Args:
             query: 查询文本
-            initial_results: 初始检索结果
+            initial_results: 初始检索结果（未使用，仅保持接口签名）
             top_k: 返回的Bundle数量
 
         Returns:
@@ -223,42 +223,43 @@ class HybridMemoryRouter:
         if not self.entity_scene_map or not self.triple_extractor:
             return []
 
-        # 1. 从初始结果中提取实体
-        query_entities = set()
-        for result in initial_results[:top_k]:
-            content = result.get('content', '')
-            entities = self.triple_extractor._extract_entities(content)
-            query_entities.update(entities)
-
+        # 仅从查询本身提取实体
+        query_entities = self.triple_extractor._extract_entities(query)
         if not query_entities:
             return []
 
-        # 2. 通过entity_scene_map扩展场景
+        # 通过entity_scene_map扩展场景
         related_scenes = {}
+
         for entity in query_entities:
             # 精确匹配
             if entity in self.entity_scene_map:
                 for scene_name in self.entity_scene_map[entity]:
                     if scene_name not in related_scenes:
-                        related_scenes[scene_name] = {"entities": [], "score": 0}
+                        related_scenes[scene_name] = {"entities": [], "score": 0, "exact_score": 0}
                     related_scenes[scene_name]["entities"].append(entity)
-                    related_scenes[scene_name]["score"] += 1
+                    related_scenes[scene_name]["score"] += 2.0  # 精确匹配权重2.0
+                    related_scenes[scene_name]["exact_score"] += 1
 
-            # 前缀/包含匹配
-            for mapped_entity, scenes in self.entity_scene_map.items():
-                if entity in mapped_entity or mapped_entity in entity:
-                    for scene_name in scenes:
-                        if scene_name not in related_scenes:
-                            related_scenes[scene_name] = {"entities": [], "score": 0}
-                        related_scenes[scene_name]["entities"].append(mapped_entity)
-                        related_scenes[scene_name]["score"] += 0.5
+            # 包含匹配（仅当entity较长时，避免短词噪声）
+            if len(entity) >= 4:
+                for mapped_entity, scenes in self.entity_scene_map.items():
+                    if entity in mapped_entity and len(mapped_entity) - len(entity) <= 10:
+                        for scene_name in scenes:
+                            if scene_name not in related_scenes:
+                                related_scenes[scene_name] = {"entities": [], "score": 0, "exact_score": 0}
+                            related_scenes[scene_name]["entities"].append(mapped_entity)
+                            related_scenes[scene_name]["score"] += 0.5
 
         if not related_scenes:
             return []
 
-        # 3. 构建EntityBundle结果
+        # 按精确匹配数排序
         bundles = []
-        for scene_name, info in sorted(related_scenes.items(), key=lambda x: -x[1]["score"])[:top_k]:
+        for scene_name, info in sorted(
+            related_scenes.items(),
+            key=lambda x: (-x[1]["exact_score"], -x[1]["score"])
+        )[:top_k]:
             scene_info = self.tunnel_scenes.get(scene_name, {})
 
             # 获取该场景的摘要信息
@@ -271,7 +272,8 @@ class HybridMemoryRouter:
                 "scene_name": scene_name,
                 "bundle_entities": info["entities"],
                 "bundle_score": info["score"],
-                "relevance": min(info["score"] / 5.0, 1.0),
+                "bundle_exact_matches": info["exact_score"],
+                "relevance": min(info["exact_score"] / 2.0, 1.0),
                 "days_ago": 0,
             }
             bundles.append(bundle)
@@ -354,17 +356,22 @@ class HybridMemoryRouter:
         Returns:
             合并后的排序结果
         """
-        # 避免重复
-        seen_ids = {r.get('id', r.get('content', '')) for r in initial_results}
+        # 使用(content的前100字符)作为唯一标识，避免id为空导致碰撞
+        seen_keys = set()
+        merged = []
 
-        merged = list(initial_results)
+        for i, r in enumerate(initial_results):
+            key = r.get('id') or r.get('content', '')[:100] or f'initial_{i}'
+            if key not in seen_keys:
+                merged.append(r)
+                seen_keys.add(key)
 
         # 添加Bundle结果（标记来源）
         for bundle in bundle_results:
             bundle_id = bundle.get('id', '')
-            if bundle_id not in seen_ids:
+            if bundle_id and bundle_id not in seen_keys:
                 merged.append(bundle)
-                seen_ids.add(bundle_id)
+                seen_keys.add(bundle_id)
 
         # 按分数重新排序
         merged.sort(key=lambda x: x.get('score', 0), reverse=True)
@@ -541,6 +548,8 @@ class HybridMemoryRouter:
                 # 将Bundle结果合并到最终结果
                 for bundle in bundle_results:
                     bundle['score'] = self._calculate_score(bundle, query)
+                    # 轻微提升Bundle分数以确保在同分时优先展示
+                    bundle['score'] += 0.001
                 results = self._merge_bundle_results(results, bundle_results)
 
         # 7. GraphFusion路径成本重排
